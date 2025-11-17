@@ -27,8 +27,10 @@ import re
 import select
 import socket
 import struct
+import subprocess
 import sys
 import time
+import csv
 
 import numpy
 import serial
@@ -40,13 +42,44 @@ def find():
 
     Searches for bluetooth devices nearby.
     """
-    if platform.system() == "Windows" or platform.system() == "Linux":
+    system = platform.system()
+    # Prefer native command-line discovery on Linux
+    if system == "Linux":
+        devices = []
+        # Try bluetoothctl first
         try:
-            import bluetooth
-        except Exception as e:
-            raise Exception(ExceptionCode.IMPORT_FAILED + str(e))
-        nearby_devices = bluetooth.discover_devices(lookup_names=True)
-        return nearby_devices
+            out = subprocess.check_output(["bluetoothctl", "devices"], stderr=subprocess.DEVNULL)
+            out = out.decode("utf-8", errors="ignore")
+            for line in out.splitlines():
+                # Expected: Device XX:XX:XX:XX:XX:XX Name
+                parts = line.strip().split(" ", 2)
+                if len(parts) >= 3 and parts[0] == "Device":
+                    mac = parts[1]
+                    name = parts[2]
+                    devices.append((mac, name))
+            if devices:
+                return devices
+        except Exception:
+            pass
+
+        # Fallback to hcitool scan
+        try:
+            out = subprocess.check_output(["hcitool", "scan"], stderr=subprocess.DEVNULL)
+            out = out.decode("utf-8", errors="ignore")
+            for line in out.splitlines()[1:]:
+                parts = line.strip().split("\t")
+                if len(parts) >= 2:
+                    mac = parts[0].strip()
+                    name = parts[1].strip()
+                    devices.append((mac, name))
+            return devices
+        except Exception:
+            # If no discovery method available, return empty list
+            return []
+    elif system == "Windows":
+        # On Windows, Bluetooth is commonly accessed via a virtual COM port (e.g., COM3).
+        # Discovery without PyBluez is platform-specific; return empty and let user use COM port.
+        return []
     else:
         raise Exception(ExceptionCode.INVALID_PLATFORM)
 
@@ -59,7 +92,7 @@ class ExceptionCode:
     DEVICE_NOT_IN_ACQUISITION = "The device is not in acquisition mode."
     INVALID_PARAMETER = "Invalid parameter."
     INVALID_VERSION = "Only available for Bitalino 2.0."
-    IMPORT_FAILED = "Please connect using the Virtual COM Port or confirm that PyBluez is installed; bluetooth wrapper failed to import with error: "
+    IMPORT_FAILED = "Please connect using the Virtual COM Port or confirm that native Bluetooth support is available; bluetooth wrapper failed with error: "
 
 
 class BITalino(object):
@@ -100,15 +133,19 @@ class BITalino(object):
             except Exception:
                 raise Exception(ExceptionCode.INVALID_PARAMETER)
         if checkMatch:
-            if platform.system() == "Windows" or platform.system() == "Linux":
+            if platform.system() in ("Windows", "Linux"):
+                # Try to use native socket-based Bluetooth (AF_BLUETOOTH + BTPROTO_RFCOMM)
                 try:
-                    import bluetooth
+                    if hasattr(socket, "AF_BLUETOOTH") and hasattr(socket, "BTPROTO_RFCOMM"):
+                        bt_sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM)
+                        bt_sock.connect((macAddress, 1))
+                        self.socket = bt_sock
+                        self.wifi = False
+                        self.serial = False
+                    else:
+                        raise Exception("native socket bluetooth not available on this Python build")
                 except Exception as e:
                     raise Exception(ExceptionCode.IMPORT_FAILED + str(e))
-                self.socket = bluetooth.BluetoothSocket(bluetooth.RFCOMM)
-                self.socket.connect((macAddress, 1))
-                self.wifi = False
-                self.serial = False
             else:
                 raise Exception(ExceptionCode.INVALID_PLATFORM)
         elif (macAddress[0:3] == "COM" and platform.system() == "Windows") or (
@@ -575,7 +612,7 @@ class BITalino(object):
 
 
 if __name__ == "__main__":
-    macAddress = "00:00:00:00:00:00"
+    macAddress = "COM3"
 
     running_time = 5
 
@@ -584,6 +621,7 @@ if __name__ == "__main__":
     samplingRate = 1000
     nSamples = 10
     digitalOutput = [1, 1]
+    output_filename = "output.csv"
 
     # Connect to BITalino
     device = BITalino(macAddress)
@@ -597,18 +635,51 @@ if __name__ == "__main__":
     # Start Acquisition
     device.start(samplingRate, acqChannels)
 
-    start = time.time()
-    end = time.time()
-    while (end - start) < running_time:
-        # Read samples
-        print(device.read(nSamples))
+    # Prepare CSV file and header
+    nChannels = len(device.analogChannels)
+    header = ["sequence", "digital_0", "digital_1", "digital_2", "digital_3"] + [f"analog_{c}" for c in device.analogChannels]
+
+    with open(output_filename, "w", newline="2") as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(header)
+
+        start = time.time()
         end = time.time()
+        while (end - start) < running_time:
+            # Read a batch of samples
+            try:
+                data = device.read(nSamples)
+            except Exception as e:
+                print("Error reading data:", e)
+                break
+
+            # Write each row to CSV
+            for row in data:
+                # convert numpy row to plain list of ints
+                try:
+                    out_row = [int(x) for x in row]
+                except Exception:
+                    out_row = list(row)
+                writer.writerow(out_row)
+            csvfile.flush()
+
+            # update time and optionally print progress
+            end = time.time()
 
     # Turn BITalino led on
-    device.trigger(digitalOutput)
+    try:
+        device.trigger(digitalOutput)
+    except Exception:
+        pass
 
     # Stop acquisition
-    device.stop()
+    try:
+        device.stop()
+    except Exception:
+        pass
 
     # Close connection
-    device.close()
+    try:
+        device.close()
+    except Exception:
+        pass
