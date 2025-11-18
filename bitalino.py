@@ -27,8 +27,10 @@ import re
 import select
 import socket
 import struct
+import subprocess
 import sys
 import time
+import csv
 
 import numpy
 import serial
@@ -164,7 +166,7 @@ class ExceptionCode:
     DEVICE_NOT_IN_ACQUISITION = "The device is not in acquisition mode."
     INVALID_PARAMETER = "Invalid parameter."
     INVALID_VERSION = "Only available for Bitalino 2.0."
-    IMPORT_FAILED = "Please connect using the Virtual COM Port or confirm that PyBluez is installed; bluetooth wrapper failed to import with error: "
+    IMPORT_FAILED = "Please connect using the Virtual COM Port or confirm that native Bluetooth support is available; bluetooth wrapper failed with error: "
 
 
 class BITalino(object):
@@ -900,10 +902,16 @@ if __name__ == "__main__":
     print(f"Saved {samples_saved} samples to {csv_filename}")
 
     # Turn BITalino led on
-    device.trigger(digitalOutput)
+    try:
+        device.trigger(digitalOutput)
+    except Exception:
+        pass
 
     # Stop acquisition
-    device.stop()
+    try:
+        device.stop()
+    except Exception:
+        pass
 
     # Close connection
     device.close()
